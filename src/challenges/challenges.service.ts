@@ -92,6 +92,7 @@ export class ChallengesService {
     difficulty?: string;
     isPaid?: string;
     search?: string;
+    status?: 'upcoming' | 'active' | 'ended' | 'all';
   }) {
     const filter: any = {};
     if (query.category) filter.category = query.category;
@@ -103,10 +104,21 @@ export class ChallengesService {
         { name: new RegExp(query.search, 'i') },
         { description: new RegExp(query.search, 'i') },
       ];
+
+    const now = new Date();
+    if (query.status === 'upcoming') {
+      filter.startDate = { $gt: now };
+    } else if (query.status === 'active') {
+      filter.startDate = { $lte: now };
+      filter.endDate = { $gte: now };
+    } else if (query.status === 'ended') {
+      filter.endDate = { $lt: now };
+    }
+
     const list = await this.challengeModel
       .find(filter)
       .populate('creator', 'firstName lastName photo role trustScore')
-      .sort({ createdAt: -1 })
+      .sort({ startDate: 1, createdAt: -1 })
       .lean()
       .exec();
     return Promise.all(list.map((c) => this.decorate(c)));
@@ -179,18 +191,56 @@ export class ChallengesService {
         path: 'challenge',
         populate: { path: 'creator', select: 'firstName lastName photo role' },
       })
-      .lean()
       .exec();
-    return Promise.all(
-      parts
-        .filter((p) => p.challenge)
-        .map(async (p) => ({
-          ...(await this.decorate(p.challenge as any)),
-          myStatus: p.status,
-          myDaysCompleted: p.daysCompleted,
-          myDaysMissed: p.daysMissed,
-        })),
-    );
+    const out: any[] = [];
+    for (const p of parts) {
+      const c: any = p.challenge;
+      if (!c) continue;
+      const reconciled = await this.reconcileParticipant(p, c);
+      out.push({
+        ...(await this.decorate(c)),
+        myStatus: reconciled.status,
+        myDaysCompleted: reconciled.daysCompleted,
+        myDaysMissed: reconciled.daysMissed,
+      });
+    }
+    return out;
+  }
+
+  /// Lazily move participant status forward based on challenge dates.
+  /// - notStarted → inProgress once startDate is reached.
+  /// - inProgress → completed (if daysCompleted meets total) or failed
+  ///   once endDate has passed.
+  /// Already-terminal statuses are left alone.
+  private async reconcileParticipant(
+    p: ParticipantDocument,
+    challenge: { startDate: Date; endDate: Date },
+  ) {
+    const now = new Date();
+    let dirty = false;
+    if (p.status === 'notStarted' && now >= challenge.startDate) {
+      p.status = 'inProgress';
+      dirty = true;
+    }
+    if (p.status === 'inProgress' && now > challenge.endDate) {
+      const totalDays = this.dayCount(challenge.startDate, challenge.endDate);
+      if (p.daysCompleted >= totalDays) {
+        p.status = 'completed';
+        await this.users.incrementCounter(
+          p.user.toString(),
+          'completedChallenges',
+        );
+      } else {
+        p.status = 'failed';
+        await this.users.incrementCounter(
+          p.user.toString(),
+          'failedChallenges',
+        );
+      }
+      dirty = true;
+    }
+    if (dirty) await p.save();
+    return p;
   }
 
   // ── Status transitions (called by checkin service) ──────────────────
@@ -247,6 +297,13 @@ export class ChallengesService {
       status: 'completed',
     });
     const rate = count > 0 ? Math.round((completed / count) * 100) : 0;
+    const now = new Date();
+    const start = c.startDate instanceof Date ? c.startDate : new Date(c.startDate);
+    const end = c.endDate instanceof Date ? c.endDate : new Date(c.endDate);
+    let status: 'upcoming' | 'active' | 'ended';
+    if (now < start) status = 'upcoming';
+    else if (now > end) status = 'ended';
+    else status = 'active';
     return {
       id: c._id.toString(),
       name: c.name,
@@ -265,6 +322,7 @@ export class ChallengesService {
       creatorType: c.creatorType,
       memberCount: count,
       completionRate: rate,
+      status,
       createdAt: c.createdAt,
     };
   }

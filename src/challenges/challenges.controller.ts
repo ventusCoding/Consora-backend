@@ -25,7 +25,10 @@ export class ChallengesController {
 
   @Get()
   list(@Query() q: any) {
-    return this.svc.list(q);
+    // Public listing hides ended challenges by default; clients can opt into
+    // 'active', 'ended', or 'all' when they need a different slice.
+    const status = q.status ?? 'upcoming';
+    return this.svc.list({ ...q, status });
   }
 
   @UseGuards(JwtAuthGuard)
