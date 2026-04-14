@@ -35,6 +35,10 @@ export class ChallengesService {
     const end = new Date(dto.endDate);
     if (end <= start)
       throw new BadRequestException('endDate must be after startDate');
+    // Allow a small clock-skew tolerance so a submission that arrives a few
+    // seconds after "now" is not rejected.
+    if (start.getTime() < Date.now() - 60_000)
+      throw new BadRequestException('startDate cannot be in the past');
 
     // Non-admin creators must meet the trust threshold.
     if (creatorRole !== 'admin') {
