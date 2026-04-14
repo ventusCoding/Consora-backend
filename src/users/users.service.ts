@@ -16,8 +16,91 @@ export class UsersService {
 
   async findByEmail(email: string, withPassword = false) {
     const q = this.model.findOne({ email: email.toLowerCase() });
-    if (withPassword) q.select('+password');
+    // Several fields on the schema are `select: false` — we re-include them
+    // here so auth flows (password check, verification/reset token flows)
+    // have access to their working values on the returned doc.
+    q.select(
+      '+emailVerificationTokenHash +passwordResetTokenHash' +
+        (withPassword ? ' +password' : ''),
+    );
     return q.exec();
+  }
+
+  /** Looks up the user who owns a given (hashed) email-verification token. */
+  async findByVerificationTokenHash(tokenHash: string) {
+    return this.model
+      .findOne({ emailVerificationTokenHash: tokenHash })
+      .select('+emailVerificationTokenHash')
+      .exec();
+  }
+
+  /** Looks up the user who owns a given (hashed) password-reset token. */
+  async findByPasswordResetTokenHash(tokenHash: string) {
+    return this.model
+      .findOne({ passwordResetTokenHash: tokenHash })
+      .select('+passwordResetTokenHash +password')
+      .exec();
+  }
+
+  /**
+   * Creates or updates a user from a verified social-provider identity
+   * (Google / Apple). Matches on provider-user-id first, then falls back
+   * to email — so a user who signed up locally and later taps Google with
+   * the same inbox gets their existing account linked instead of duped.
+   */
+  async upsertSocialUser(opts: {
+    provider: 'google' | 'apple';
+    providerUserId: string;
+    email: string;
+    firstName?: string;
+    lastName?: string;
+    photo?: string;
+  }) {
+    const providerField =
+      opts.provider === 'google' ? 'googleUserId' : 'appleUserId';
+    let user = await this.model
+      .findOne({ [providerField]: opts.providerUserId })
+      .exec();
+    if (!user && opts.email) {
+      user = await this.model
+        .findOne({ email: opts.email.toLowerCase() })
+        .exec();
+    }
+    if (!user) {
+      user = await this.model.create({
+        firstName: opts.firstName || 'Consora',
+        lastName: opts.lastName || 'User',
+        email: opts.email.toLowerCase(),
+        password: '',
+        photo: opts.photo || '',
+        authProvider: opts.provider,
+        emailVerified: true,
+        [providerField]: opts.providerUserId,
+      });
+      return user;
+    }
+    // Link provider id to the existing account (and promote to social if
+    // still marked "local"). We never overwrite firstName/lastName that
+    // the user may have customised.
+    let dirty = false;
+    if (!(user as any)[providerField]) {
+      (user as any)[providerField] = opts.providerUserId;
+      dirty = true;
+    }
+    if (user.authProvider === 'local') {
+      user.authProvider = opts.provider;
+      dirty = true;
+    }
+    if (!user.emailVerified) {
+      user.emailVerified = true;
+      dirty = true;
+    }
+    if (!user.photo && opts.photo) {
+      user.photo = opts.photo;
+      dirty = true;
+    }
+    if (dirty) await user.save();
+    return user;
   }
 
   async findById(id: string) {
@@ -67,6 +150,24 @@ export class UsersService {
 
   async ban(id: string, banned = true) {
     return this.update(id, { isBanned: banned });
+  }
+
+  /**
+   * Admin-triggered email verification toggle.
+   * Marking a user as verified also clears any outstanding verification
+   * token so the old email link can't be replayed; marking them as
+   * unverified leaves tokens alone — the next login will auto-reissue.
+   */
+  async setEmailVerified(id: string, verified: boolean) {
+    const u = await this.model.findById(id).exec();
+    if (!u) throw new NotFoundException('User not found');
+    u.emailVerified = verified;
+    if (verified) {
+      u.emailVerificationTokenHash = null;
+      u.emailVerificationExpiresAt = null;
+    }
+    await u.save();
+    return u;
   }
 
   // ── Profile editing ─────────────────────────────────────────────────────
@@ -313,33 +414,84 @@ export class UsersService {
 
   /**
    * Recompute and persist the user trust score.
-   * Formula (0..100):
-   *   base 50
-   *   + 5 per completed challenge  (cap +30)
-   *   - 8 per failed challenge     (cap -40)
-   *   + min(20, likes/5 + messages/20)  (social activity)
+   * Formula (0..100), activity-driven (a brand-new user starts at 0):
+   *   + 5 per completed challenge   (cap +60)
+   *   - 5 per failed challenge      (cap -30)
+   *   + min(40, likes/3 + messages/10)  (social activity)
    */
   async recomputeTrust(id: string) {
     const u = await this.model.findById(id).exec();
     if (!u) return;
-    const completedBonus = Math.min(30, u.completedChallenges * 5);
-    const failPenalty = Math.min(40, u.failedChallenges * 8);
-    const social = Math.min(20, u.likesGiven / 5 + u.messagesSent / 20);
+    // Admins are seeded at 100 and creators are pinned at 100 (either
+    // earned or promoted by admin). Neither should be recomputed.
+    if (u.role === 'admin' || u.role === 'creator') return u;
+    const completedBonus = Math.min(60, u.completedChallenges * 5);
+    const failPenalty = Math.min(30, u.failedChallenges * 5);
+    const social = Math.min(40, u.likesGiven / 3 + u.messagesSent / 10);
     const score = Math.max(
       0,
-      Math.min(100, Math.round(50 + completedBonus - failPenalty + social)),
+      Math.min(100, Math.round(completedBonus - failPenalty + social)),
     );
     u.trustScore = score;
 
-    // Auto-promote to creator once threshold met (idempotent).
+    // Auto-promote to creator once threshold met (idempotent). Default is
+    // 100 — a user must build a perfect track record to earn it.
     const threshold = parseInt(
-      process.env.CREATOR_TRUST_THRESHOLD || '75',
+      process.env.CREATOR_TRUST_THRESHOLD || '100',
       10,
     );
     if (u.role === 'user' && score >= threshold) {
       u.role = 'creator';
     }
     await u.save();
+    return u;
+  }
+
+  /**
+   * Admin: set the user's trust score directly (0..100). The role follows
+   * the score automatically:
+   *   - score >= threshold (100)  → promote 'user' to 'creator'
+   *   - score <  threshold        → demote 'creator' back to 'user'
+   * Admins are immune (pinned at 100 by the seeder).
+   */
+  async setTrustScore(id: string, value: number) {
+    const u = await this.model.findById(id).exec();
+    if (!u) throw new NotFoundException('User not found');
+    if (u.role === 'admin') return u; // admins stay at their seeded value
+    const score = Math.max(0, Math.min(100, Math.round(value)));
+    u.trustScore = score;
+    const threshold = parseInt(
+      process.env.CREATOR_TRUST_THRESHOLD || '100',
+      10,
+    );
+    if (u.role === 'user' && score >= threshold) {
+      u.role = 'creator';
+    } else if (u.role === 'creator' && score < threshold) {
+      u.role = 'user';
+    }
+    await u.save();
+    return u;
+  }
+
+  /**
+   * Admin: change a user's role. Promoting to 'creator' pins trust to 100.
+   * Demoting back to 'user' resets the score so the formula can rebuild it.
+   */
+  async setRole(id: string, role: 'user' | 'creator' | 'admin') {
+    const u = await this.model.findById(id).exec();
+    if (!u) throw new NotFoundException('User not found');
+    u.role = role;
+    if (role === 'creator' || role === 'admin') {
+      u.trustScore = 100;
+    } else if (role === 'user') {
+      // Let the formula decide on the next recompute — reset to the
+      // activity-driven baseline rather than leave a stale 100 behind.
+      u.trustScore = 0;
+    }
+    await u.save();
+    if (role === 'user') {
+      return this.recomputeTrust(id).then((x) => x ?? u);
+    }
     return u;
   }
 
@@ -372,6 +524,8 @@ export class UsersService {
       role: o.role,
       isOnline: o.isOnline,
       isBanned: o.isBanned,
+      emailVerified: !!o.emailVerified,
+      authProvider: o.authProvider ?? 'local',
       trustScore: o.trustScore,
       completedChallenges: o.completedChallenges,
       failedChallenges: o.failedChallenges,

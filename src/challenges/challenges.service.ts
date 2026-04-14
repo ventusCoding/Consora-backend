@@ -40,16 +40,18 @@ export class ChallengesService {
     if (start.getTime() < Date.now() - 60_000)
       throw new BadRequestException('startDate cannot be in the past');
 
-    // Non-admin creators must meet the trust threshold.
-    if (creatorRole !== 'admin') {
+    // Admins and creators bypass the trust check — creators are promoted
+    // either by reaching the score threshold (auto) or by admin override.
+    // Regular users must meet the threshold to unlock creator capabilities.
+    if (creatorRole !== 'admin' && creatorRole !== 'creator') {
       const u = await this.users.findById(creatorId);
       const threshold = parseInt(
-        process.env.CREATOR_TRUST_THRESHOLD || '75',
+        process.env.CREATOR_TRUST_THRESHOLD || '100',
         10,
       );
       if (!u || u.trustScore < threshold) {
         throw new ForbiddenException(
-          `Trust score ${threshold}+ required to create challenges`,
+          `Trust score ${threshold} required to create challenges`,
         );
       }
     }

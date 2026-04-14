@@ -23,7 +23,10 @@ export class UsersController {
 
   @Get('me')
   async me(@CurrentUser() user: JwtUser) {
-    const u = await this.users.findById(user.sub);
+    // Always recompute on read so historical records (which used the
+    // old base-50 formula) self-heal to match the current formula.
+    const refreshed = await this.users.recomputeTrust(user.sub);
+    const u = refreshed ?? (await this.users.findById(user.sub));
     if (!u) throw new NotFoundException();
     return this.users.toPublic(u);
   }

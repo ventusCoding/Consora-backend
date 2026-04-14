@@ -21,6 +21,8 @@ async function run() {
       password: hash,
       role: 'admin',
       trustScore: 100,
+      emailVerified: true,
+      authProvider: 'local',
     });
     console.log('[seed] admin user created:', email);
   } else {

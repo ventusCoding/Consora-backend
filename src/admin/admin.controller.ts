@@ -94,9 +94,27 @@ export class AdminController {
     return this.users.toPublic(u);
   }
 
+  @Post('users/:id/verify-email')
+  async verifyEmail(
+    @Param('id') id: string,
+    @Body() body: { verified?: boolean },
+  ) {
+    const u = await this.users.setEmailVerified(id, body?.verified ?? true);
+    return this.users.toPublic(u);
+  }
+
   @Patch('users/:id/role')
   async setRole(@Param('id') id: string, @Body() body: { role: string }) {
-    const u = await this.users.update(id, { role: body.role } as any);
+    const u = await this.users.setRole(id, body.role as any);
+    return this.users.toPublic(u);
+  }
+
+  @Patch('users/:id/trust-score')
+  async setTrustScore(
+    @Param('id') id: string,
+    @Body() body: { trustScore: number },
+  ) {
+    const u = await this.users.setTrustScore(id, Number(body.trustScore));
     return this.users.toPublic(u);
   }
 
