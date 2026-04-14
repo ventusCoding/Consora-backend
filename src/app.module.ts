@@ -11,6 +11,7 @@ import { ReportsModule } from './reports/reports.module';
 import { RatingsModule } from './ratings/ratings.module';
 import { AdminModule } from './admin/admin.module';
 import { UploadsModule } from './uploads/uploads.module';
+import { LiveModule } from './live/live.module';
 
 @Module({
   imports: [
@@ -28,6 +29,7 @@ import { UploadsModule } from './uploads/uploads.module';
     RatingsModule,
     AdminModule,
     UploadsModule,
+    LiveModule,
   ],
 })
 export class AppModule {}

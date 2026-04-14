@@ -8,6 +8,7 @@ import { Model, Types } from 'mongoose';
 import { Checkin, CheckinDocument } from './schemas/checkin.schema';
 import { ChallengesService } from '../challenges/challenges.service';
 import { UsersService } from '../users/users.service';
+import { LiveGateway } from '../live/live.gateway';
 
 @Injectable()
 export class CheckinsService {
@@ -15,6 +16,7 @@ export class CheckinsService {
     @InjectModel(Checkin.name) private model: Model<CheckinDocument>,
     private challenges: ChallengesService,
     private users: UsersService,
+    private live: LiveGateway,
   ) {}
 
   async submit(
@@ -45,6 +47,16 @@ export class CheckinsService {
     if (status === 'approved') {
       await this.challenges.markDayCompleted(challengeId, userId);
     }
+
+    // Broadcast the check-in so any client watching this challenge or user
+    // (e.g. the Live Tracking screen) sees it without a round-trip refresh.
+    this.live.emitCheckin({
+      challengeId,
+      userId,
+      dayNumber: dto.dayNumber,
+      status,
+      createdAt: (doc as any).createdAt ?? new Date(),
+    });
     return doc;
   }
 
@@ -92,6 +104,11 @@ export class CheckinsService {
       c.challenge.toString(),
       c.user.toString(),
     );
+    this.live.emitDayMissed({
+      challengeId: c.challenge.toString(),
+      userId: c.user.toString(),
+      dayNumber: c.dayNumber,
+    });
     return c;
   }
 
@@ -106,6 +123,13 @@ export class CheckinsService {
       c.challenge.toString(),
       c.user.toString(),
     );
+    this.live.emitCheckin({
+      challengeId: c.challenge.toString(),
+      userId: c.user.toString(),
+      dayNumber: c.dayNumber,
+      status: 'approved',
+      createdAt: (c as any).createdAt ?? new Date(),
+    });
     return c;
   }
 
